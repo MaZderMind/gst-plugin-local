@@ -1,0 +1,176 @@
+NOTES
+=====
+
+Nomenclature
+------------
+
+ ____"Source Pipeline"___                       ____"Sink Pipeline"___
+/                        \                     /                      \
+any a/v source -> localsink -> localsurface -> localsrc -> any a/v sink
+                  \_______/                    \______/
+                    "Sink"                     "Source"
+
+Perfect Timestamps (nice to have):
++----------+
+| Buffer 1 |
++----------+
+            +----------+
+            | Buffer 2 |
+            +----------+
+
+Monotonic Timestamps (required):
++----------+               +----------+
+| Buffer 1 |               | Buffer 1 |
++----------+               +----------+
+       +----------+                       +----------+
+       | Buffer 2 |                       | Buffer 2 |
+       +----------+                       +----------+
+
+
+Non-Monotonic Timestamps (forbidden):
+  +----------+             +----------+
+  | Buffer 1 |             | Buffer 1 |
+  +----------+             +----------+
++----------+               +----------+
+| Buffer 2 |               | Buffer 2 |
++----------+               +----------+
+
+
+Livecycle
+---------
+The Surface represents the Livecycle of the Sink and Source and the ways
+they can act depending on the State of the respective other half.
+
+The Surface can have the following states and move between them:
+
+ - UNDEFINED
+ - WAITFORSRC
+ - WAITFORSINK
+ - RUNNING
+ - UNDERFLOW
+
+When a Source starts up, it aquires a surface and checks the surface-state.
+If the state is UNDEFINED, it updates the state to WAITFORSINK.
+If the state is WAITFORSRC, it updates the state to RUNNING and initiates
+determination the time-differential.
+
+When a Sink starts up, it aquires a surface and also checks the surface-state.
+If the state is UNDEFINED, it updates the state to WAITFORSRC.
+If the state is WAITFORSINK, it updates the state to RUNNING and initiates
+determination the time-differential.
+
+When a Sink or a Source aquires a aurface on startup, that is not in one of the
+above mentioned states, the surface is already connected to the respective type
+of element and is considered "in use". The newly starting Element should post an
+ERROR to its Pipeline and terminate.
+
+When the Sink passes away, it should update the surface-state
+back to WAITFORSINK. It should additionally flush the surface-queue.
+
+When the Source passes away, it should update the surface-state
+back to WAITFORSRC.
+
+The Source can sense an underflow condition, when it has been waiting for a
+new buffer to arrive in the surface-queue for a defined time without one
+arriving. In this case the Source can update the surface-state to ABORT.
+
+The next time the Sink tries to push a buffer into the surface-queue it will
+identify this condition and in this case shut itself down by sending an
+ERROR to its pipeline. This way a Sink that is too slow will automatically
+disconnect after some time and give the Source time to catch up, so that a slow
+Sink cannot disturb the Source-Pipeline to a point where it stops working.
+
+
+Time-Differential Determination
+-------------------------------
+Currently two methods to determine the time-differential between the two
+pipelines are possible.
+
+a) when setting the surface-state to WAITFOR* or RUNNING, sink and source set a
+   function-pointer on the surface (and NULL it before thes pass away). When
+   the surface-state is finally set to RUNNING, the element triggers a call on
+   the surface which then in turn uses the function pointers to call into both
+   elements. The called function will then aquire the current running time of
+   their pipeline and report back to the surface. The surface can now calculate
+   the time-differential and store it in a property.
+
+b) when the render-vmethod on the sink or the create-method on the source is
+   called they fetch the aquire the current running time of their pipeline and
+   update a field on the surface with it. When the surface-state is finally set
+   to RUNNING, the element triggers a call on the surface which then in turn
+   uses the stored timestamp to calculate the time-differential and store it in
+   a property.
+
+
+Sink Scheduling
+---------------
+The sink scheduling is pretty simple. When a buffer from upstream comes in, it's
+pushed onto a queue which is part of the surface. The sink does not enforce the
+incoming timing, altough it may warn on not monotonic or imperfect timestamps.
+
+When a new buffer is pushed into the queue, the Sink also calls g_cond_broadcast
+on a GCond in the surface, to allow the Source to wake up.
+
+
+Source Scheduling
+-----------------
+When the source starts up it initializes a field specifiying the timestamp of
+the next buffer to the current running time of the pipeline.
+
+The source operates in Push-Mode, so it can specify the timestamps of the
+outgoing buffers as it needs to. The GstPushSrc Baseclass schedules calls to the
+create-vmethod.
+
+The create-method first checks the surface-state. If it is WAITFORSINK (= there
+is no sink connected) it creates a Buffer with a black Frame. The Start-Time is
+taken from the field holding the timestamp of the next buffer, the length is
+exactly 1/fps seconds.
+
+If the state is RUNNING, the source checks the surface-queue for emptyness.
+It it is not empty, the source pops a buffer from the queue, transposes its
+timestamp accoding to the time differential. The sink now checks if the
+transposed timestamp is monotonic in relation to the last sent timestampt.
+
+If it is not, this is a major error on the Sink, so the Source can update the
+surface-state to ABORT which will trigger the Sink to close on the next call
+turn.
+
+If the surface-queue is empty, the Source asserts a g_cond_wait_until (wrapped
+in a propper loop) on the surface-condition, specifying a timeout of, for
+example, 3*1/fps. If after this time there's still nothing in the queue, the
+Sink will update the surface-state to ABORT with the above explained
+consequences.
+
+
+Tests
+-----
+There is/should be/will be a test-program that can test the following cases:
+
+./gstlocal-test single-pipeline
+Run Sink & Source in the same pipeline
+
+./gstlocal-test source-then-sink
+First start the Source, then later the Sink
+
+./gstlocal-test sink-then-source
+First start the Sink, then later the Source
+
+./gstlocal-test multiple-sinks
+Multiple Sinks trying to connect to the same Source
+
+./gstlocal-test multiple-sources
+Multiple Sources trying to connect to the same Sink
+
+./gstlocal-test audio-vs-video
+Multiple A Video-Source tryign to connect to an Audio-Sink or vv.
+
+./gstlocal-test timing
+Generate an A/V stream. Increae the Timestamps of both by a fixed amount
+(ie. +1 second). Push one of them via a localsink/localsrc pair in the same
+pipeline and one of them directly to a muxer. In the muxed file they should line
+up again.
+
+All tests can take an optional second parameter which specifies the type of
+Buffer to test with, specified as caps:
+  ./gstlocal-test multiple-sources "audio/x-raw,format=F32LE,rate=48000"
+  ./gstlocal-test multiple-sources "video/x-raw,format=UYVY,width=1920,height=1080,framerate=1/25"
